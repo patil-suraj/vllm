@@ -23,7 +23,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Tarsier2 model compatible with HuggingFace weights."""
+"""Inference-only Tarsier2 model compatible with HuggingFace weights.
+
+Note: In Tarsier2, videos are treated as multi-images rather than having separate 
+video token handling. Video frames are processed as individual images and use 
+image tokens for placeholder replacement.
+"""
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any, Callable, Literal, Optional, TypedDict, Union
@@ -823,7 +828,8 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         return pil_img
 
     def convert_to_tarsier2_format(self, prompt: str, images: Optional[list] = None, videos: Optional[list] = None):
-        """Convert input to Tarsier2 message format"""
+        """Convert input to Tarsier2 message format
+        Note: In Tarsier2, videos are treated as multi-images, so video frames are processed as individual images"""
         messages = []
         user_content = []
         
@@ -835,7 +841,7 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
                     "image": img
                 })
         
-        # Add videos  
+        # Add videos (treated as multi-images in Tarsier2)
         if videos:
             for video in videos:
                 user_content.append({
@@ -1061,9 +1067,10 @@ class Tarsier2DummyInputsBuilder(BaseDummyInputsBuilder[Tarsier2ProcessingInfo])
 
         hf_processor = self.info.get_hf_processor()
         image_token: str = hf_processor.image_token
-        video_token: str = hf_processor.video_token
 
-        return image_token * num_images + video_token * num_videos
+        # In Tarsier2, videos are treated as multi-images, so we use image tokens for both images and video frames
+        # The total count will be dynamically calculated based on actual frame counts during processing
+        return image_token * (num_images + num_videos)
 
     def get_dummy_mm_data(
         self,
@@ -1117,18 +1124,28 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
             'min_pixels': 0
         })
         
+        # Calculate total number of image-like items (images + video frames) for dynamic pixel limits
+        total_items = 0
+        if 'image' in processed_mm_data:
+            images = processed_mm_data['image'] if isinstance(processed_mm_data['image'], list) else [processed_mm_data['image']]
+            total_items += len(images)
+        if 'video' in processed_mm_data:
+            videos = processed_mm_data['video'] if isinstance(processed_mm_data['video'], list) else [processed_mm_data['video']]
+            # Estimate frames per video for pixel calculation (videos are treated as multi-images)
+            total_items += len(videos) * 8  # Approximate 8 frames per video
+        
+        # Adjust pixel limits based on total items
+        if total_items > 0:
+            max_pixels_per_sample = 128 * 384 * 384
+            if max_pixels_per_sample // total_items < processing_config['max_pixels']:
+                processing_config['max_pixels'] = max_pixels_per_sample // total_items
+                processing_config['min_pixels'] = min(processing_config['min_pixels'], processing_config['max_pixels'])
+
         # Apply custom preprocessing to images if present
         if 'image' in processed_mm_data:
             images = processed_mm_data['image']
             if not isinstance(images, list):
                 images = [images]
-            
-            # Calculate dynamic pixel limits based on number of images
-            num_images = len(images)
-            max_pixels_per_sample = 128 * 384 * 384
-            if num_images > 0 and max_pixels_per_sample // num_images < processing_config['max_pixels']:
-                processing_config['max_pixels'] = max_pixels_per_sample // num_images
-                processing_config['min_pixels'] = min(processing_config['min_pixels'], processing_config['max_pixels'])
             
             # Apply custom preprocessing
             processed_images = []
@@ -1159,10 +1176,8 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
         tokenizer = self.info.get_tokenizer()
         vocab = tokenizer.get_vocab()
 
-        placeholder = {
-            "image": vocab[hf_processor.image_token],
-            "video": vocab[hf_processor.video_token],
-        }
+        # In Tarsier2, videos are treated as multi-images, so we only use image tokens 
+        image_token_id = vocab[hf_processor.image_token]
 
         merge_length = image_processor.merge_size**2
 
@@ -1171,12 +1186,12 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
             assert isinstance(grid_thw, torch.Tensor)
 
             num_tokens = int(grid_thw.prod()) // merge_length
-            return [placeholder[modality]] * num_tokens
+            return [image_token_id] * num_tokens
 
         return [
             PromptReplacement(
                 modality=modality,
-                target=[placeholder[modality]],
+                target=[image_token_id],
                 replacement=partial(get_replacement_tarsier2,
                                     modality=modality),
             ) for modality in ("image", "video")
@@ -1195,6 +1210,12 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
                                         dummy_inputs=Tarsier2DummyInputsBuilder)
 class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
                                       SupportsLoRA, SupportsPP):
+    """Tarsier2 model for conditional generation.
+    
+    Key difference from Qwen2VL: In Tarsier2, videos are treated as multi-images
+    rather than having separate video processing. All video frames use image tokens
+    and are processed through the same vision pipeline as images.
+    """
 
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
@@ -1414,9 +1435,10 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None:
+            # In Tarsier2, videos are treated as multi-images, so we only use image_token_id
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings,
-                [self.config.image_token_id, self.config.video_token_id])
+                self.config.image_token_id)
         return inputs_embeds
 
     def get_input_embeddings_v0(
@@ -1437,11 +1459,12 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         if video_input is not None:
             video_embeds = self._process_video_input(video_input)
+            # In Tarsier2, videos are treated as multi-images, so we use image_token_id
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
                 inputs_embeds,
                 video_embeds,
-                placeholder_token_id=self.config.video_token_id,
+                placeholder_token_id=self.config.image_token_id,
             )
         return inputs_embeds
 
@@ -1468,7 +1491,8 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             image_grid_thw: Tensor `(n_images, 3)` of image 3D grid in LLM.
                 `None` if no images are passed.
             pixel_values_videos: Pixel values of videos to be fed to a model.
-                `None` if no videos are passed.
+                `None` if no videos are passed. Note: In Tarsier2, video frames
+                are processed as multi-images using image tokens.
             video_grid_thw: Tensor `(n_videos, 3)` of video 3D grid in LLM.
                 `None` if no videos are passed.
         """
