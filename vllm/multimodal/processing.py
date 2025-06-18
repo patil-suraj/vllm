@@ -1466,24 +1466,29 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         for modality, cache_items in mm_cache_items.items():
             for cache_item in cache_items:
                 if cache_item.value is None:
-                    kw_item = mm_missing_kwargs.get_item(
-                        modality,
-                        mm_missing_next_idx[modality],
-                    )
-                    cache_item_new = ProcessingCacheItem(
-                        key=cache_item.key,
-                        value=kw_item,
-                    )
+                    # Check if modality exists in mm_missing_kwargs before calling get_item
+                    if modality in mm_missing_kwargs.modalities:
+                        kw_item = mm_missing_kwargs.get_item(
+                            modality,
+                            mm_missing_next_idx[modality],
+                        )
+                        cache_item_new = ProcessingCacheItem(
+                            key=cache_item.key,
+                            value=kw_item,
+                        )
 
-                    cache.put_item(cache_item_new)
-                    mm_missing_next_idx[modality] += 1
+                        cache.put_item(cache_item_new)
+                        mm_missing_next_idx[modality] += 1
+                        merged_items[modality].append(cache_item_new)
+                    # If modality doesn't exist in mm_missing_kwargs, skip this cache item
+                    # This can happen during profiling with dummy inputs that don't generate
+                    # multimodal outputs for certain modalities
                 else:
                     cache_item_new = ProcessingCacheItem(
                         key=cache_item.key,
                         value=cache_item.value,
                     )
-
-                merged_items[modality].append(cache_item_new)
+                    merged_items[modality].append(cache_item_new)
 
         return dict(merged_items)
 
