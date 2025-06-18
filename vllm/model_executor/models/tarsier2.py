@@ -223,8 +223,8 @@ class TarsierProcessor(ProcessorMixin):
         merge_size=1,
         temporal_patch_size=1,
         max_seq_len=8192,
-        n_frames=8,
-        max_pixels=int(1280 * 720 // 2),
+        n_frames=16,
+        max_pixels=460800,  # 1280 * 720 // 2
         min_pixels=0,
         max_pixels_per_sample=128 * 384 * 384,
         **kwargs,
@@ -327,8 +327,8 @@ class TarsierVisionProcessor:
     """Handles vision processing for Tarsier2, including custom preprocessing."""
     
     def __init__(self, 
-                 n_frames: int = 8,
-                 max_pixels: int = int(1280 * 720 // 2),
+                 n_frames: int = 16,
+                 max_pixels: int = 460800,  # 1280 * 720 // 2
                  min_pixels: int = 0,
                  temporal_patch_size: int = 1,
                  max_pixels_per_sample: int = 128 * 384 * 384):
@@ -560,15 +560,13 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Initialize Tarsier vision processor
-        mm_config = self.ctx.model_config.get_multimodal_config()
-        processor_kwargs = mm_config.mm_processor_kwargs or {}
-        
+        # Initialize Tarsier vision processor with hardcoded values
+        # Based on tarsier2_default_config.yaml defaults
         self.vision_processor = TarsierVisionProcessor(
-            n_frames=processor_kwargs.get('n_frames', 8),
-            max_pixels=processor_kwargs.get('max_pixels', int(1280 * 720 // 2)),
-            min_pixels=processor_kwargs.get('min_pixels', 0),
-            temporal_patch_size=processor_kwargs.get('temporal_patch_size', 1)
+            n_frames=16,  # Default frame count from config
+            max_pixels=460800,  # 1280 * 720 // 2 from config
+            min_pixels=0,
+            temporal_patch_size=1
         )
 
     def get_hf_config(self):
@@ -592,29 +590,27 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         
         tokenizer = self.ctx.get_tokenizer()
         
-        # Get processor kwargs from model config
-        mm_config = self.ctx.model_config.get_multimodal_config()
-        processor_kwargs = mm_config.mm_processor_kwargs or {}
-        
+        # Use hardcoded values based on tarsier2_default_config.yaml
         return TarsierProcessor(
             image_processor=image_processor,
             tokenizer=tokenizer,
-            n_frames=processor_kwargs.get('n_frames', 8),
-            max_pixels=processor_kwargs.get('max_pixels', int(1280 * 720 // 2)),
-            min_pixels=processor_kwargs.get('min_pixels', 0),
-            temporal_patch_size=processor_kwargs.get('temporal_patch_size', 1),
-            max_pixels_per_sample=processor_kwargs.get('max_pixels_per_sample', 128 * 384 * 384),
+            n_frames=16,  # Default frame count from config
+            max_pixels=460800,  # 1280 * 720 // 2 from config
+            min_pixels=0,
+            temporal_patch_size=1,
+            max_pixels_per_sample=128 * 384 * 384,  # Memory budget
             **kwargs
         )
 
     def process_tarsier_messages(self, messages: List[dict], processing_config: dict = None) -> List[dict]:
         """Process messages using Tarsier vision processor."""
         if processing_config is None:
+            # Use hardcoded values from tarsier2_default_config.yaml
             processing_config = {
-                'do_crop': False,
-                'do_padding': False, 
-                'do_resize': False,
-                'max_pixels': int(1280 * 720 // 2),
+                'do_crop': False,     # No central crop by default
+                'do_padding': False,  # No square padding by default
+                'do_resize': False,   # No square resize by default
+                'max_pixels': 460800,  # 1280 * 720 // 2 from config
                 'min_pixels': 0
             }
         
@@ -663,17 +659,17 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         size: Optional[dict[str, int]] = None,
         **kwargs: object,
     ):
-        mm_config = self.ctx.model_config.get_multimodal_config()
-        if mm_config.mm_processor_kwargs:
-            kwargs.update(mm_config.mm_processor_kwargs)
-
-        # Follow TarsierProcessor pattern - pass min_pixels and max_pixels directly
-        # without trying to construct a size dictionary that causes issues
+        # Use hardcoded defaults instead of trying to read from config
+        # Pass min_pixels and max_pixels directly without size dictionary issues
         if min_pixels is not None:
             kwargs["min_pixels"] = min_pixels
+        else:
+            kwargs["min_pixels"] = 0  # Hardcoded default
 
         if max_pixels is not None:
             kwargs["max_pixels"] = max_pixels
+        else:
+            kwargs["max_pixels"] = 460800  # 1280 * 720 // 2 from config
 
         # Only pass size if it was explicitly provided
         if size is not None:
@@ -689,57 +685,24 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         size: Optional[dict[str, int]] = None,
         **kwargs: object,
     ) -> Qwen2VLImageProcessor:
-        # Check if model config has malformed size parameter that would cause issues
-        mm_config = self.ctx.model_config.get_multimodal_config()
-        has_malformed_size = False
-        if mm_config.mm_processor_kwargs and 'size' in mm_config.mm_processor_kwargs:
-            config_size = mm_config.mm_processor_kwargs['size']
-            if isinstance(config_size, dict):
-                required_keys = {'shortest_edge', 'longest_edge'}
-                if not required_keys.issubset(config_size.keys()):
-                    has_malformed_size = True
+        # Use direct AutoImageProcessor creation to avoid config issues
+        # with hardcoded safe parameters
+        from transformers import AutoImageProcessor
         
-        if has_malformed_size:
-            # Create image processor directly to avoid config merge issue
-            # Following TarsierProcessor pattern of using minimal configuration
-            from transformers import AutoImageProcessor
-            
-            # Get essential parameters only
-            processor_kwargs = {}
-            if min_pixels is not None:
-                processor_kwargs["min_pixels"] = min_pixels
-            if max_pixels is not None:
-                processor_kwargs["max_pixels"] = max_pixels
-            
-            # Add other safe parameters from mm_processor_kwargs
-            if mm_config.mm_processor_kwargs:
-                safe_params = ['do_convert_rgb', 'do_normalize', 'do_rescale', 'do_resize', 
-                              'image_mean', 'image_std', 'max_pixels', 'min_pixels', 
-                              'merge_size', 'patch_size', 'resample', 'rescale_factor', 
-                              'temporal_patch_size']
-                for param in safe_params:
-                    if param in mm_config.mm_processor_kwargs:
-                        processor_kwargs[param] = mm_config.mm_processor_kwargs[param]
-            
-            return AutoImageProcessor.from_pretrained(
-                self.ctx.model_config.model,
-                revision=self.ctx.model_config.revision,
-                trust_remote_code=self.ctx.model_config.trust_remote_code,
-                **processor_kwargs,
-            )
-        else:
-            # Normal path when no malformed size parameter
-            processor_kwargs = self._get_image_processor_kwargs(
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-                size=size,
-                **kwargs
-            )
-            
-            return cached_image_processor_from_config(
-                self.ctx.model_config,
-                **processor_kwargs,
-            )
+        # Get essential parameters with hardcoded defaults
+        processor_kwargs = {}
+        processor_kwargs["min_pixels"] = min_pixels if min_pixels is not None else 0
+        processor_kwargs["max_pixels"] = max_pixels if max_pixels is not None else 460800  # 1280 * 720 // 2
+        
+        # Add any additional kwargs
+        processor_kwargs.update(kwargs)
+        
+        return AutoImageProcessor.from_pretrained(
+            self.ctx.model_config.model,
+            revision=self.ctx.model_config.revision,
+            trust_remote_code=self.ctx.model_config.trust_remote_code,
+            **processor_kwargs,
+        )
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         return {"image": None, "video": None}
@@ -1001,14 +964,14 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
             "content": user_content
         })
         
-        # Get processing config from mm_kwargs
-        processing_config = mm_kwargs.get('processing_config', {
-            'do_crop': False,
-            'do_padding': False, 
-            'do_resize': False,
-            'max_pixels': int(1280 * 720 // 2),
+        # Use hardcoded processing config based on tarsier2_default_config.yaml
+        processing_config = {
+            'do_crop': False,     # No central crop by default
+            'do_padding': False,  # No square padding by default
+            'do_resize': False,   # No square resize by default
+            'max_pixels': 460800,  # 1280 * 720 // 2 from config
             'min_pixels': 0
-        })
+        }
         
         # Process using TarsierProcessor
         return processor(messages, processing_config=processing_config)

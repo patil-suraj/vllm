@@ -150,48 +150,44 @@ def main():
         print("Using synthetic video frames for demonstration...")
         use_synthetic = True
     
-    # Configure multimodal settings for Tarsier2
-    mm_processor_kwargs = {
-        "n_frames": n_frames,  # Number of frames to sample
-        "max_pixels": int(1280 * 720 // 2),  # Max pixels per frame
-        "min_pixels": 0,
-        "processing_config": {
-            "do_crop": False,     # Apply central crop
-            "do_padding": False,  # Pad to square
-            "do_resize": False,   # Resize to square
-            "max_pixels": int(1280 * 720 // 2),
-            "min_pixels": 0
-        }
-    }
-    
     # Initialize vLLM engine with Tarsier2
+    # Note: Tarsier2 uses hardcoded configuration values from tarsier2_default_config.yaml
+    # - n_frames: 16 (number of video frames to sample)
+    # - max_pixels: 460800 (1280*720/2, max pixels per frame) 
+    # - preprocessing: no crop/padding/resize by default
     print("🚀 Initializing vLLM with Tarsier2...")
+    print(f"   Using {16} frames per video (hardcoded)")
+    print(f"   Max pixels per frame: {460800} (hardcoded)")
+    
     llm = LLM(
         model=model_path,
         trust_remote_code=True,  # Required for Tarsier2
         max_model_len=4096,
         gpu_memory_utilization=0.9,
-        multimodal_config={
-            "mm_processor_kwargs": mm_processor_kwargs
-        }
     )
     print("✅ vLLM initialized successfully")
     
-    # Extract or create video frames
+    # Extract or create video frames 
+    # Note: Tarsier2 processor uses hardcoded 16 frames, but we can extract more and let it subsample
+    frames_to_extract = max(n_frames, 16)  # Extract at least 16, more if requested
+    
     if use_synthetic:
-        print(f"🎨 Creating {n_frames} synthetic video frames...")
-        video_frames = create_synthetic_video_frames(num_frames=n_frames)
+        print(f"🎨 Creating {frames_to_extract} synthetic video frames...")
+        video_frames = create_synthetic_video_frames(num_frames=frames_to_extract)
         video_name = "synthetic_video"
     else:
-        print(f"🎬 Extracting {n_frames} frames from: {os.path.basename(video_path)}")
+        print(f"🎬 Extracting {frames_to_extract} frames from: {os.path.basename(video_path)}")
         try:
-            video_frames = extract_video_frames(video_path, max_frames=n_frames)
+            video_frames = extract_video_frames(video_path, max_frames=frames_to_extract)
             video_name = os.path.basename(video_path)
         except Exception as e:
             print(f"❌ Error extracting frames: {e}")
             print("Falling back to synthetic frames...")
-            video_frames = create_synthetic_video_frames(num_frames=n_frames)
+            video_frames = create_synthetic_video_frames(num_frames=frames_to_extract)
             video_name = "synthetic_video"
+    
+    if len(video_frames) != 16:
+        print(f"ℹ️  Note: Extracted {len(video_frames)} frames, but Tarsier2 will subsample to 16 frames automatically")
     
     print(f"✅ Using {len(video_frames)} frames")
     
