@@ -870,11 +870,14 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
         messages = []
         user_content = []
         
-        # Process images
-        if 'image' in mm_data:
+        # Process images - only if there are actual images
+        if 'image' in mm_data and mm_data['image']:
             images = mm_data['image']
             if not isinstance(images, list):
                 images = [images]
+            
+            # Filter out None values
+            images = [img for img in images if img is not None]
             
             for img in images:
                 if isinstance(img, str):
@@ -890,11 +893,14 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
                         "image": img
                     })
         
-        # Process videos 
-        if 'video' in mm_data:
+        # Process videos - only if there are actual videos
+        if 'video' in mm_data and mm_data['video']:
             videos = mm_data['video']
             if not isinstance(videos, list):
                 videos = [videos]
+                
+            # Filter out None values
+            videos = [video for video in videos if video is not None]
                 
             for video in videos:
                 if isinstance(video, str):
@@ -944,7 +950,8 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
         vocab = tokenizer.get_vocab()
 
         # In Tarsier2, videos are treated as multi-images, so we only use image tokens 
-        image_token_id = vocab[hf_processor.image_token]
+        # image_token_id = vocab[hf_processor.image_token]
+        image_token_id = 151655
 
         merge_length = image_processor.merge_size**2
 
