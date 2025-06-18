@@ -525,7 +525,9 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         )
 
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen2VLConfig)
+        # Get the base config without strict type checking since Tarsier2 
+        # can work with different config types (Qwen2VLConfig, LlavaConfig, etc.)
+        return self.ctx.get_hf_config()
 
     def get_hf_processor(
         self,
@@ -674,9 +676,11 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
 
         hf_config = self.get_hf_config()
         vision_config = hf_config.vision_config
-        patch_size = vision_config.patch_size
-        merge_size = vision_config.spatial_merge_size
-        temporal_patch_size = vision_config.temporal_patch_size
+        
+        # Handle different config types (Qwen2VLConfig, LlavaConfig, etc.)
+        patch_size = getattr(vision_config, 'patch_size', 14)  # Default for most vision models
+        merge_size = getattr(vision_config, 'spatial_merge_size', 2)  # Qwen2VL default
+        temporal_patch_size = getattr(vision_config, 'temporal_patch_size', 2)  # Qwen2VL default
 
         if do_resize:
             resized_height, resized_width = smart_resize(
@@ -1000,8 +1004,13 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         self.config = config
         self.multimodal_config = multimodal_config
 
+        # Handle different config types - ensure we have a compatible vision config
+        vision_config = getattr(config, 'vision_config', None)
+        if vision_config is None:
+            raise ValueError("Model config must have vision_config for Tarsier2")
+            
         self.visual = Qwen2VisionTransformer(
-            config.vision_config,
+            vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             quant_config=self._maybe_ignore_quant_config(quant_config),
             prefix=maybe_prefix(prefix, "visual"),
@@ -1023,6 +1032,16 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         if isinstance(quant_config, (GPTQConfig, GPTQMarlinConfig)):
             return None
         return quant_config
+
+    def _get_image_token_id(self) -> int:
+        """Get image token ID from config, with fallback for different config types."""
+        image_token_id = getattr(self.config, 'image_token_id', None)
+        if image_token_id is not None:
+            return image_token_id
+        
+        # Fallback: Use default image token ID commonly used in multimodal models
+        # This is a reasonable default for most vision-language models
+        return 151655  # This is the common image token ID for Qwen2-VL
 
     def _validate_and_reshape_mm_tensor(self, mm_input: object,
                                         name: str) -> torch.Tensor:
@@ -1201,7 +1220,7 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             # In Tarsier2, videos are treated as multi-images, so we only use image_token_id
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings,
-                self.config.image_token_id)
+                self._get_image_token_id())
         return inputs_embeds
 
     def get_input_embeddings_v0(
@@ -1211,13 +1230,15 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         video_input: Optional[Qwen2VLVideoPixelInputs] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.get_input_embeddings(input_ids)
+        image_token_id = self._get_image_token_id()
+
         if image_input is not None:
             image_embeds = self._process_image_input(image_input)
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
                 inputs_embeds,
                 image_embeds,
-                placeholder_token_id=self.config.image_token_id,
+                placeholder_token_id=image_token_id,
             )
 
         if video_input is not None:
@@ -1227,7 +1248,7 @@ class Tarsier2ForConditionalGeneration(nn.Module, SupportsMultiModal,
                 input_ids,
                 inputs_embeds,
                 video_embeds,
-                placeholder_token_id=self.config.image_token_id,
+                placeholder_token_id=image_token_id,
             )
         return inputs_embeds
 
