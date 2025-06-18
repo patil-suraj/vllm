@@ -33,10 +33,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any, List, Optional, Union
 import os
-import random
-import tempfile
 import decord
-import uuid
 
 import torch
 import torch.nn as nn
@@ -251,12 +248,10 @@ class TarsierProcessor(ProcessorMixin):
         )
 
     def __call__(self, messages, processing_config=None, **kwargs):
-        """Process messages with Tarsier custom preprocessing."""
+        """Process messages with Tarsier minimal preprocessing."""
         if processing_config is None:
+            # Default config - only pixel resizing is used
             processing_config = {
-                'do_crop': False,
-                'do_padding': False,
-                'do_resize': False,
                 'max_pixels': self.max_pixels,
                 'min_pixels': self.min_pixels
             }
@@ -307,7 +302,6 @@ class TarsierProcessor(ProcessorMixin):
         return BatchFeature(result)
 
 
-
     def batch_decode(self, *args, **kwargs):
         """Forward to tokenizer's batch_decode."""
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -324,7 +318,7 @@ class TarsierProcessor(ProcessorMixin):
 
 
 class TarsierVisionProcessor:
-    """Handles vision processing for Tarsier2, including custom preprocessing."""
+    """Handles vision processing for Tarsier2 with minimal preprocessing based on default config."""
     
     def __init__(self, 
                  n_frames: int = 16,
@@ -338,43 +332,8 @@ class TarsierVisionProcessor:
         self.temporal_patch_size = temporal_patch_size
         self.max_pixels_per_sample = max_pixels_per_sample
     
-    def centralcrop(self, pil_img: Image.Image, rate: List[float] = [4, 3]) -> Image.Image:
-        """Apply central crop with specified aspect ratio."""
-        width, height = pil_img.size
-        size = (width, height)
-        min_len = min(size)
-        longer_side = 0 if width >= height else 1
-        center = (width/2, height/2)
-        box = [0, 0, size[0], size[1]]
-
-        box[longer_side] = max(0, center[longer_side] - 1/2*min_len/rate[1]*rate[0])
-        box[2 + longer_side] = min(size[longer_side], center[longer_side] + 1/2*min_len/rate[1]*rate[0])
-
-        pil_img = pil_img.crop(box)
-        return pil_img
-    
-    def expand2square(self, pil_img: Image.Image, background_color: tuple = (0, 0, 0)) -> Image.Image:
-        """Expand image to square by padding."""
-        width, height = pil_img.size
-        if width == height:
-            return pil_img
-        elif width > height:
-            result = Image.new(pil_img.mode, (width, width), background_color)
-            result.paste(pil_img, (0, (width - height) // 2))
-            return result
-        else:
-            result = Image.new(pil_img.mode, (height, height), background_color)
-            result.paste(pil_img, ((height - width) // 2, 0))
-            return result
-
-    def resize2square(self, pil_img: Image.Image) -> Image.Image:
-        """Resize image to square."""
-        width, height = pil_img.size
-        pil_img = pil_img.resize((max(width, height), max(width, height)))
-        return pil_img
-    
     def resize2pixels(self, pil_img: Image.Image, max_pixels: int = None, min_pixels: int = None) -> Image.Image:
-        """Resize image based on pixel count using smart_resize."""
+        """Resize image based on pixel count using smart_resize - the only preprocessing used by default."""
         width, height = pil_img.size
         new_height, new_width = smart_resize(
             height, width, factor=1, 
@@ -386,18 +345,14 @@ class TarsierVisionProcessor:
 
     def preprocess_image(self, pil_img: Union[Image.Image, List[Image.Image]], 
                         processing_config: dict) -> Union[Image.Image, List[Image.Image]]:
-        """Apply custom preprocessing to image(s)."""
+        """Apply minimal preprocessing - only pixel resizing based on default config."""
         if processing_config is None:
             return pil_img
         
         images = pil_img if isinstance(pil_img, list) else [pil_img]
         
-        if processing_config.get('do_crop', False):
-            images = [self.centralcrop(img, rate=[4, 3]) for img in images]
-        if processing_config.get('do_padding', False):
-            images = [self.expand2square(img, (0, 0, 0)) for img in images]
-        if processing_config.get('do_resize', False):
-            images = [self.resize2square(img) for img in images]
+        # Based on default config, only max_pixels processing is used
+        # (do_crop=false, do_padding=false, do_resize=false)
         if processing_config.get('max_pixels'):
             images = [self.resize2pixels(
                 img, 
@@ -588,7 +543,7 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
             **kwargs
         )
         
-        tokenizer = self.ctx.get_tokenizer()
+        tokenizer = self.get_tokenizer()
         
         # Use hardcoded values based on tarsier2_default_config.yaml
         return TarsierProcessor(
@@ -603,13 +558,10 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         )
 
     def process_tarsier_messages(self, messages: List[dict], processing_config: dict = None) -> List[dict]:
-        """Process messages using Tarsier vision processor."""
+        """Process messages using Tarsier vision processor with default config."""
         if processing_config is None:
-            # Use hardcoded values from tarsier2_default_config.yaml
+            # Default config from tarsier2_default_config.yaml - only max_pixels is used
             processing_config = {
-                'do_crop': False,     # No central crop by default
-                'do_padding': False,  # No square padding by default
-                'do_resize': False,   # No square resize by default
                 'max_pixels': 460800,  # 1280 * 720 // 2 from config
                 'min_pixels': 0
             }
@@ -702,6 +654,7 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
             revision=self.ctx.model_config.revision,
             trust_remote_code=self.ctx.model_config.trust_remote_code,
             **processor_kwargs,
+            size=None,
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
@@ -964,11 +917,9 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
             "content": user_content
         })
         
-        # Use hardcoded processing config based on tarsier2_default_config.yaml
+        # Use simplified processing config based on tarsier2_default_config.yaml
+        # Only max_pixels processing is used (other preprocessing disabled by default)
         processing_config = {
-            'do_crop': False,     # No central crop by default
-            'do_padding': False,  # No square padding by default
-            'do_resize': False,   # No square resize by default
             'max_pixels': 460800,  # 1280 * 720 // 2 from config
             'min_pixels': 0
         }

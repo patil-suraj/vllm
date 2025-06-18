@@ -151,13 +151,13 @@ def main():
         use_synthetic = True
     
     # Initialize vLLM engine with Tarsier2
-    # Note: Tarsier2 uses hardcoded configuration values from tarsier2_default_config.yaml
+    # Note: Tarsier2 uses simplified configuration from tarsier2_default_config.yaml
     # - n_frames: 16 (number of video frames to sample)
-    # - max_pixels: 460800 (1280*720/2, max pixels per frame) 
-    # - preprocessing: no crop/padding/resize by default
+    # - max_pixels: 460800 (pixel limit per frame, only preprocessing used)
+    # - All other preprocessing disabled (no crop/padding/square resize)
     print("🚀 Initializing vLLM with Tarsier2...")
-    print(f"   Using {16} frames per video (hardcoded)")
-    print(f"   Max pixels per frame: {460800} (hardcoded)")
+    print(f"   Using {16} frames per video")
+    print(f"   Max pixels per frame: {460800} (only preprocessing applied)")
     
     llm = LLM(
         model=model_path,
