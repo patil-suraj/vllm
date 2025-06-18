@@ -164,6 +164,7 @@ def main():
         trust_remote_code=True,  # Required for Tarsier2
         max_model_len=4096,
         gpu_memory_utilization=0.9,
+        hf_overrides={"architectures": ["Tarsier2ForConditionalGeneration"]}
     )
     print("✅ vLLM initialized successfully")
     
