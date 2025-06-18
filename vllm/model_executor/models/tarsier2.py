@@ -269,22 +269,15 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         if mm_config.mm_processor_kwargs:
             kwargs.update(mm_config.mm_processor_kwargs)
 
+        # Follow TarsierProcessor pattern - pass min_pixels and max_pixels directly
+        # without trying to construct a size dictionary that causes issues
         if min_pixels is not None:
             kwargs["min_pixels"] = min_pixels
-
-            if size is None:
-                size = {"shortest_edge": min_pixels}
-            else:
-                size["shortest_edge"] = min_pixels
 
         if max_pixels is not None:
             kwargs["max_pixels"] = max_pixels
 
-            if size is None:
-                size = {"longest_edge": max_pixels}
-            else:
-                size["longest_edge"] = max_pixels
-
+        # Only pass size if it was explicitly provided
         if size is not None:
             kwargs["size"] = size
 
@@ -519,24 +512,7 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
             'min_pixels': 0
         })
         
-        # Calculate total number of image-like items (images + video frames) for dynamic pixel limits
-        total_items = 0
-        if 'image' in processed_mm_data:
-            images = processed_mm_data['image'] if isinstance(processed_mm_data['image'], list) else [processed_mm_data['image']]
-            total_items += len(images)
-        if 'video' in processed_mm_data:
-            videos = processed_mm_data['video'] if isinstance(processed_mm_data['video'], list) else [processed_mm_data['video']]
-            # Estimate frames per video for pixel calculation (videos are treated as multi-images)
-            total_items += len(videos) * 8  # Approximate 8 frames per video
-        
-        # Adjust pixel limits based on total items
-        if total_items > 0:
-            max_pixels_per_sample = 128 * 384 * 384
-            if max_pixels_per_sample // total_items < processing_config['max_pixels']:
-                processing_config['max_pixels'] = max_pixels_per_sample // total_items
-                processing_config['min_pixels'] = min(processing_config['min_pixels'], processing_config['max_pixels'])
-
-        # Apply custom preprocessing to images if present
+        # Apply custom preprocessing to images if present - following TarsierProcessor pattern
         if 'image' in processed_mm_data:
             images = processed_mm_data['image']
             if not isinstance(images, list):
@@ -553,10 +529,18 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
             
             processed_mm_data['image'] = processed_images
         
+        # Call HF processor with minimal kwargs to avoid size parameter issues
+        # Following TarsierProcessor pattern of using default processor configuration
+        processor_kwargs = dict(mm_kwargs)
+        # Remove processing_config as it's not needed by the HF processor
+        processor_kwargs.pop('processing_config', None)
+        
         return self.info.ctx.call_hf_processor(
-            self.info.get_hf_processor(**mm_kwargs),
+            self.info.get_hf_processor(**processor_kwargs),
             dict(text=prompt, **processed_mm_data),
-            self.info._get_image_processor_kwargs(**mm_kwargs),
+            # Pass only essential image processor kwargs to avoid size parameter conflicts
+            {k: v for k, v in self.info._get_image_processor_kwargs(**processor_kwargs).items() 
+             if k in ['min_pixels', 'max_pixels'] and v is not None},
         )
 
     def _get_prompt_updates(

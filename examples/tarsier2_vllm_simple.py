@@ -39,8 +39,8 @@ def extract_video_frames(video_path: str, max_frames: int = 8) -> List[Image.Ima
 
 def main():
     # Example usage
-    model_path = "/path/to/tarsier2/model"  # Update this path
-    video_path = "/path/to/your/video.mp4"  # Update this path
+    model_path = "/blob/raw/huggingface_repos/Tarsier2-Recap-7b"  # Update this path
+    video_path = "-q0kwjzxOlE_000004.mp4"  # Update this path
     
     # Check if paths exist
     if not os.path.exists(model_path):
