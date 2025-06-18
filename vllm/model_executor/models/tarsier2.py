@@ -31,14 +31,18 @@ image tokens for placeholder replacement.
 """
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
+import os
+import random
+import tempfile
+import decord
+import uuid
 
 import torch
 import torch.nn as nn
-from PIL import Image
-from transformers import BatchFeature
-from transformers.models.qwen2_vl import (Qwen2VLImageProcessor,
-                                          Qwen2VLProcessor)
+from PIL import Image, ImageSequence
+from transformers import BatchFeature, ProcessorMixin, AutoImageProcessor, AutoTokenizer
+from transformers.models.qwen2_vl import Qwen2VLImageProcessor
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
@@ -91,6 +95,413 @@ Qwen2VLImageInputs = Union[Qwen2VLImagePixelInputs,
 
 Qwen2VLVideoInputs = Union[Qwen2VLVideoPixelInputs,
                            Qwen2VLVideoEmbeddingInputs]
+
+
+# === Tarsier Video/Image Processing Utilities === #
+
+def sample_frame_indices(start_frame: int, total_frames: int, n_frames: int) -> List[int]:
+    """Sample frame indices uniformly, always including first and last frames."""
+    if n_frames == 1:
+        return [0]
+    if total_frames <= n_frames:
+        return list(range(total_frames))
+    sample_ids = [round(i * (total_frames - 1) / (n_frames - 1)) for i in range(n_frames)]
+    sample_ids = [i + start_frame for i in sample_ids]
+    return sample_ids
+
+
+def get_visual_type(input_file: str) -> str:
+    """Determine the visual media type from file extension."""
+    ext = os.path.splitext(input_file)[-1].lower()
+    if ext in {'.gif'}:
+        return 'gif'
+    elif ext in {'.mp4', '.avi', '.webm', '.mov', '.mkv', '.wmv'}:
+        return 'video'
+    elif ext in {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}:
+        return 'image'
+    else:
+        return 'unknown'
+
+
+def sample_video_frames(video_path: str, n_frames: int = 8) -> List[Image.Image]:
+    """Sample frames from video file."""
+    assert os.path.exists(video_path), f"File not found: {video_path}"
+    
+    if video_path.endswith('.gif'):
+        # Handle GIF files
+        gif_frames = Image.open(video_path)
+        total_frames = gif_frames.n_frames
+        
+        frame_indices = sample_frame_indices(0, total_frames, n_frames)
+        frames = []
+        i = 0
+        for frame in ImageSequence.Iterator(gif_frames):
+            if i in frame_indices:
+                frames.append(frame.convert('RGB'))
+            i += 1
+        return frames
+    else:
+        # Handle video files
+        vr = decord.VideoReader(video_path, num_threads=1, ctx=decord.cpu(0))
+        vr.seek(0)
+        total_frames = len(vr)
+        
+        frame_indices = sample_frame_indices(0, total_frames, n_frames)
+        frames = vr.get_batch(frame_indices).asnumpy()
+        frames = [Image.fromarray(f).convert('RGB') for f in frames]
+        return frames
+
+
+def load_image(image_path: str) -> Image.Image:
+    """Load single image from file."""
+    assert os.path.exists(image_path), f"File not found: {image_path}"
+    return Image.open(image_path).convert('RGB')
+
+
+def format_tarsier_sample(media_file: str = None, prompt: str = "Describe the video in detail.") -> dict:
+    """Format input into Tarsier message structure."""
+    sample = {"messages": []}
+    
+    user_content = {"role": "user", "content": []}
+    
+    if media_file is not None:
+        media_type = get_visual_type(media_file)
+        if media_type in ("video", "gif"):
+            media_type = "video"
+        elif media_type == "image":
+            media_type = "image"
+        else:
+            raise ValueError(f"Unsupported media type: {media_type}")
+            
+        media_path_key = f"{media_type}_file"
+        user_content["content"].append({
+            "type": media_type,
+            media_type: {
+                media_path_key: media_file,
+            }
+        })
+    
+    user_content["content"].append({
+        "type": "text",
+        "text": prompt
+    })
+    
+    assistant_content = {"role": "assistant", "content": []}
+    
+    sample["messages"].append(user_content)
+    sample["messages"].append(assistant_content)
+    
+    if media_file is not None:
+        sample["task"] = f"{media_type}/QA"
+    else:
+        sample["task"] = 'text-only'
+    
+    return sample
+
+
+class TarsierProcessor(ProcessorMixin):
+    """
+    Tarsier processor that handles both images and videos with custom preprocessing.
+    Inherits from ProcessorMixin to be compatible with transformers ecosystem.
+    """
+    
+    attributes = ["image_processor", "tokenizer"]
+    valid_kwargs = [
+        "chat_template", "image_token", "patch_size", "merge_size", 
+        "temporal_patch_size", "max_seq_len", "n_frames", "max_pixels", "min_pixels"
+    ]
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        chat_template=None,
+        image_token="<image>",
+        patch_size=None,
+        merge_size=1,
+        temporal_patch_size=1,
+        max_seq_len=8192,
+        n_frames=8,
+        max_pixels=int(1280 * 720 // 2),
+        min_pixels=0,
+        max_pixels_per_sample=128 * 384 * 384,
+        **kwargs,
+    ):
+        self.image_token = image_token
+        self.patch_size = patch_size
+        self.merge_size = merge_size
+        self.temporal_patch_size = temporal_patch_size
+        self.max_seq_len = max_seq_len
+        self.n_frames = n_frames
+        self.max_pixels = max_pixels
+        self.min_pixels = min_pixels
+        self.max_pixels_per_sample = max_pixels_per_sample
+
+        super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        
+        # Initialize vision processor for custom preprocessing
+        self.vision_processor = TarsierVisionProcessor(
+            n_frames=n_frames,
+            max_pixels=max_pixels,
+            min_pixels=min_pixels,
+            temporal_patch_size=temporal_patch_size,
+            max_pixels_per_sample=max_pixels_per_sample
+        )
+
+    def __call__(self, messages, processing_config=None, **kwargs):
+        """Process messages with Tarsier custom preprocessing."""
+        if processing_config is None:
+            processing_config = {
+                'do_crop': False,
+                'do_padding': False,
+                'do_resize': False,
+                'max_pixels': self.max_pixels,
+                'min_pixels': self.min_pixels
+            }
+        
+        # Process messages using vision processor
+        processed_messages = self.vision_processor.process_messages(messages, processing_config)
+        
+        # Convert to format expected by underlying image processor and tokenizer
+        text_content = ""
+        images = []
+        videos = []
+        
+        for msg in processed_messages:
+            for content in msg["content"]:
+                if content["type"] == "text":
+                    text_content += content["text"] + " "
+                elif content["type"] == "image":
+                    if isinstance(content["image"], list):
+                        images.extend(content["image"])
+                    else:
+                        images.append(content["image"])
+                elif content["type"] == "video":
+                    if isinstance(content["video"], list):
+                        videos.extend(content["video"])
+                    else:
+                        videos.append(content["video"])
+        
+        # Process with underlying processors
+        result = {}
+        
+        if images:
+            image_inputs = self.image_processor(images=images, return_tensors="pt")
+            result.update(image_inputs)
+        
+        if videos:
+            # For Tarsier2, videos are treated as images
+            video_inputs = self.image_processor(images=videos, return_tensors="pt")
+            # Rename to video format
+            if "pixel_values" in video_inputs:
+                result["pixel_values_videos"] = video_inputs["pixel_values"]
+                if "image_grid_thw" in video_inputs:
+                    result["video_grid_thw"] = video_inputs["image_grid_thw"]
+        
+        if text_content.strip():
+            text_inputs = self.tokenizer(text_content.strip(), return_tensors="pt")
+            result.update(text_inputs)
+        
+        return BatchFeature(result)
+
+
+
+    def batch_decode(self, *args, **kwargs):
+        """Forward to tokenizer's batch_decode."""
+        return self.tokenizer.batch_decode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        """Forward to tokenizer's decode."""
+        return self.tokenizer.decode(*args, **kwargs)
+
+    @property
+    def model_input_names(self):
+        tokenizer_input_names = self.tokenizer.model_input_names
+        image_processor_input_names = self.image_processor.model_input_names
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
+
+
+class TarsierVisionProcessor:
+    """Handles vision processing for Tarsier2, including custom preprocessing."""
+    
+    def __init__(self, 
+                 n_frames: int = 8,
+                 max_pixels: int = int(1280 * 720 // 2),
+                 min_pixels: int = 0,
+                 temporal_patch_size: int = 1,
+                 max_pixels_per_sample: int = 128 * 384 * 384):
+        self.n_frames = n_frames
+        self.max_pixels = max_pixels
+        self.min_pixels = min_pixels
+        self.temporal_patch_size = temporal_patch_size
+        self.max_pixels_per_sample = max_pixels_per_sample
+    
+    def centralcrop(self, pil_img: Image.Image, rate: List[float] = [4, 3]) -> Image.Image:
+        """Apply central crop with specified aspect ratio."""
+        width, height = pil_img.size
+        size = (width, height)
+        min_len = min(size)
+        longer_side = 0 if width >= height else 1
+        center = (width/2, height/2)
+        box = [0, 0, size[0], size[1]]
+
+        box[longer_side] = max(0, center[longer_side] - 1/2*min_len/rate[1]*rate[0])
+        box[2 + longer_side] = min(size[longer_side], center[longer_side] + 1/2*min_len/rate[1]*rate[0])
+
+        pil_img = pil_img.crop(box)
+        return pil_img
+    
+    def expand2square(self, pil_img: Image.Image, background_color: tuple = (0, 0, 0)) -> Image.Image:
+        """Expand image to square by padding."""
+        width, height = pil_img.size
+        if width == height:
+            return pil_img
+        elif width > height:
+            result = Image.new(pil_img.mode, (width, width), background_color)
+            result.paste(pil_img, (0, (width - height) // 2))
+            return result
+        else:
+            result = Image.new(pil_img.mode, (height, height), background_color)
+            result.paste(pil_img, ((height - width) // 2, 0))
+            return result
+
+    def resize2square(self, pil_img: Image.Image) -> Image.Image:
+        """Resize image to square."""
+        width, height = pil_img.size
+        pil_img = pil_img.resize((max(width, height), max(width, height)))
+        return pil_img
+    
+    def resize2pixels(self, pil_img: Image.Image, max_pixels: int = None, min_pixels: int = None) -> Image.Image:
+        """Resize image based on pixel count using smart_resize."""
+        width, height = pil_img.size
+        new_height, new_width = smart_resize(
+            height, width, factor=1, 
+            max_pixels=max_pixels or self.max_pixels,
+            min_pixels=min_pixels or self.min_pixels
+        )
+        pil_img = pil_img.resize((new_width, new_height))
+        return pil_img
+
+    def preprocess_image(self, pil_img: Union[Image.Image, List[Image.Image]], 
+                        processing_config: dict) -> Union[Image.Image, List[Image.Image]]:
+        """Apply custom preprocessing to image(s)."""
+        if processing_config is None:
+            return pil_img
+        
+        images = pil_img if isinstance(pil_img, list) else [pil_img]
+        
+        if processing_config.get('do_crop', False):
+            images = [self.centralcrop(img, rate=[4, 3]) for img in images]
+        if processing_config.get('do_padding', False):
+            images = [self.expand2square(img, (0, 0, 0)) for img in images]
+        if processing_config.get('do_resize', False):
+            images = [self.resize2square(img) for img in images]
+        if processing_config.get('max_pixels'):
+            images = [self.resize2pixels(
+                img, 
+                int(processing_config['max_pixels']), 
+                int(processing_config.get('min_pixels', 0))
+            ) for img in images]
+        
+        return images[0] if isinstance(pil_img, Image.Image) else images
+    
+    def load_vision_item(self, vision_item: Union[dict, Image.Image, List[Image.Image]], vision_type: str) -> List[Image.Image]:
+        """Load vision item supporting multiple formats:
+        - Dict with 'image_file' or 'video_file' keys (file paths) 
+        - PIL.Image directly (for single images)
+        - List[PIL.Image] directly (for videos as frame sequences)
+        """
+        if vision_type == 'image':
+            if isinstance(vision_item, dict):
+                # File path case: {"image_file": "/path/to/image.jpg"}
+                image_file = vision_item.get('image_file')
+                if image_file:
+                    return [load_image(image_file)]
+            elif isinstance(vision_item, Image.Image):
+                # PIL Image directly
+                return [vision_item]
+            elif isinstance(vision_item, list) and len(vision_item) > 0 and isinstance(vision_item[0], Image.Image):
+                # List of PIL Images (treat first as single image)
+                return [vision_item[0]]
+                
+        elif vision_type == 'video':
+            if isinstance(vision_item, dict):
+                # File path case: {"video_file": "/path/to/video.mp4"}
+                video_file = vision_item.get('video_file')
+                if video_file:
+                    return sample_video_frames(video_file, self.n_frames)
+            elif isinstance(vision_item, list) and len(vision_item) > 0 and isinstance(vision_item[0], Image.Image):
+                # List of PIL Images directly (video frames)
+                # Subsample if we have more frames than needed
+                if len(vision_item) <= self.n_frames:
+                    return vision_item
+                else:
+                    # Use the same uniform sampling strategy as for video files
+                    frame_indices = sample_frame_indices(0, len(vision_item), self.n_frames)
+                    return [vision_item[i] for i in frame_indices]
+            elif isinstance(vision_item, Image.Image):
+                # Single PIL Image treated as single-frame video
+                return [vision_item]
+        
+        raise ValueError(f"Invalid vision item: {vision_item} (type: {type(vision_item)}) for vision_type: {vision_type}")
+    
+    def adjust_pixel_limits_for_multiple_items(self, messages: List[dict], processing_config: dict) -> dict:
+        """Adjust max_pixels when there are multiple images/videos to fit within sample limits."""
+        config = dict(processing_config)
+        
+        # Count total number of frames needed
+        num_frames = 0
+        for msg in messages:
+            for content in msg['content']:
+                if content['type'] == 'image':
+                    num_frames += self.temporal_patch_size
+                elif content['type'] == 'video':
+                    # For video files, estimate frames needed
+                    if isinstance(content['video'], dict) and 'video_file' in content['video']:
+                        num_frames += self.n_frames
+                    else:
+                        num_frames += len(content['video']) if isinstance(content['video'], list) else 1
+        
+        # Adjust max_pixels if we have multiple items
+        if num_frames > 0 and self.max_pixels_per_sample // num_frames < config['max_pixels']:
+            config['max_pixels'] = self.max_pixels_per_sample // num_frames
+            config['min_pixels'] = min(config['min_pixels'], config['max_pixels'])
+        
+        return config
+
+    def process_messages(self, messages: List[dict], processing_config: dict) -> List[dict]:
+        """Process messages to load and preprocess vision content."""
+        # Adjust pixel limits for multiple items
+        adjusted_config = self.adjust_pixel_limits_for_multiple_items(messages, processing_config)
+        
+        processed_messages = []
+        
+        for msg in messages:
+            processed_msg = {"role": msg["role"], "content": []}
+            
+            for content in msg["content"]:
+                if content["type"] == "text":
+                    processed_msg["content"].append(content)
+                elif content["type"] in ["image", "video"]:
+                    # Load vision content
+                    vision_item = content[content["type"]]  
+                    images = self.load_vision_item(vision_item, content["type"])
+                    
+                    # Apply preprocessing
+                    images = self.preprocess_image(images, adjusted_config)
+                    
+                    # Create processed content
+                    processed_content = {
+                        "type": content["type"],
+                        content["type"]: images
+                    }
+                    processed_msg["content"].append(processed_content)
+            
+            processed_messages.append(processed_msg)
+        
+        return processed_messages
 
 
 def _tarsier2_field_config(hf_inputs: Mapping[str, torch.Tensor]):
@@ -147,6 +558,19 @@ class Tarsier2MultiModalDataParser(MultiModalDataParser):
 
 class Tarsier2ProcessingInfo(BaseProcessingInfo):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize Tarsier vision processor
+        mm_config = self.ctx.model_config.get_multimodal_config()
+        processor_kwargs = mm_config.mm_processor_kwargs or {}
+        
+        self.vision_processor = TarsierVisionProcessor(
+            n_frames=processor_kwargs.get('n_frames', 8),
+            max_pixels=processor_kwargs.get('max_pixels', int(1280 * 720 // 2)),
+            min_pixels=processor_kwargs.get('min_pixels', 0),
+            temporal_patch_size=processor_kwargs.get('temporal_patch_size', 1)
+        )
+
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen2VLConfig)
 
@@ -157,70 +581,44 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         max_pixels: Optional[int] = None,
         size: Optional[dict[str, int]] = None,
         **kwargs: object,
-    ) -> Qwen2VLProcessor:
-        return self.ctx.get_hf_processor(
-            Qwen2VLProcessor,
-            image_processor=self.get_image_processor(
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-                size=size,
-                use_fast=kwargs.get("use_fast")),
-            **kwargs,
+    ) -> TarsierProcessor:
+        """Get TarsierProcessor instance with custom preprocessing."""
+        image_processor = self.get_image_processor(
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            size=size,
+            **kwargs
+        )
+        
+        tokenizer = self.ctx.get_tokenizer()
+        
+        # Get processor kwargs from model config
+        mm_config = self.ctx.model_config.get_multimodal_config()
+        processor_kwargs = mm_config.mm_processor_kwargs or {}
+        
+        return TarsierProcessor(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            n_frames=processor_kwargs.get('n_frames', 8),
+            max_pixels=processor_kwargs.get('max_pixels', int(1280 * 720 // 2)),
+            min_pixels=processor_kwargs.get('min_pixels', 0),
+            temporal_patch_size=processor_kwargs.get('temporal_patch_size', 1),
+            max_pixels_per_sample=processor_kwargs.get('max_pixels_per_sample', 128 * 384 * 384),
+            **kwargs
         )
 
-    def _apply_custom_tarsier2_preprocessing(self, image: Image.Image, config: dict) -> Image.Image:
-        """Apply Tarsier2 specific image preprocessing"""
-        if config.get('do_crop', False):
-            image = self._centralcrop(image, rate=[4, 3])
-        if config.get('do_padding', False):
-            image = self._expand2square(image, (0, 0, 0))
-        if config.get('do_resize', False):
-            image = self._resize2square(image)
-        if config.get('max_pixels'):
-            image = self._resize2pixels(
-                image, 
-                int(config['max_pixels']), 
-                int(config.get('min_pixels', 0))
-            )
-        return image
-
-    def _expand2square(self, pil_img: Image.Image, background_color):
-        width, height = pil_img.size
-        if width == height:
-            return pil_img
-        elif width > height:
-            result = Image.new(pil_img.mode, (width, width), background_color)
-            result.paste(pil_img, (0, (width - height) // 2))
-            return result
-        else:
-            result = Image.new(pil_img.mode, (height, height), background_color)
-            result.paste(pil_img, ((height - width) // 2, 0))
-            return result
-
-    def _resize2square(self, pil_img: Image.Image):
-        width, height = pil_img.size
-        pil_img = pil_img.resize((max(width, height), max(width, height)))
-        return pil_img
-    
-    def _centralcrop(self, pil_img: Image.Image, rate=[4, 3]):
-        width, height = pil_img.size
-        size = (width, height)
-        min_len = min(size)
-        longer_side = 0 if width >= height else 1
-        center = (width/2, height/2)
-        box = [0, 0, size[0], size[1]]
-
-        box[longer_side] = max(0, center[longer_side] - 1/2*min_len/rate[1]*rate[0])
-        box[2 + longer_side] = min(size[longer_side], center[longer_side] + 1/2*min_len/rate[1]*rate[0])
-
-        pil_img = pil_img.crop(box)
-        return pil_img
-    
-    def _resize2pixels(self, pil_img: Image.Image, max_pixels=None, min_pixels=None):
-        width, height = pil_img.size
-        new_height, new_width = smart_resize(height, width, factor=1, max_pixels=max_pixels, min_pixels=min_pixels)
-        pil_img = pil_img.resize((new_width, new_height))
-        return pil_img
+    def process_tarsier_messages(self, messages: List[dict], processing_config: dict = None) -> List[dict]:
+        """Process messages using Tarsier vision processor."""
+        if processing_config is None:
+            processing_config = {
+                'do_crop': False,
+                'do_padding': False, 
+                'do_resize': False,
+                'max_pixels': int(1280 * 720 // 2),
+                'min_pixels': 0
+            }
+        
+        return self.vision_processor.process_messages(messages, processing_config)
 
     def convert_to_tarsier2_format(self, prompt: str, images: Optional[list] = None, videos: Optional[list] = None):
         """Convert input to Tarsier2 message format
@@ -497,8 +895,8 @@ class Tarsier2DummyInputsBuilder(BaseDummyInputsBuilder[Tarsier2ProcessingInfo])
         num_images = mm_counts.get("image", 0)
         num_videos = mm_counts.get("video", 0)
 
-        hf_processor = self.info.get_hf_processor()
-        image_token: str = hf_processor.image_token
+        tarsier_processor = self.info.get_hf_processor()
+        image_token: str = tarsier_processor.image_token
 
         # In Tarsier2, videos are treated as multi-images, so we use image tokens for both images and video frames
         # The total count will be dynamically calculated based on actual frame counts during processing
@@ -544,48 +942,76 @@ class Tarsier2MultiModalProcessor(BaseMultiModalProcessor[Tarsier2ProcessingInfo
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # Apply Tarsier2 custom preprocessing before calling HF processor
-        processed_mm_data = dict(mm_data)
+        """Use TarsierProcessor directly for processing."""
+        # Get TarsierProcessor instance
+        processor = self.info.get_hf_processor(**mm_kwargs)
         
-        # Get processing config from mm_kwargs or use defaults
+        # Create Tarsier message format
+        messages = []
+        user_content = []
+        
+        # Process images
+        if 'image' in mm_data:
+            images = mm_data['image']
+            if not isinstance(images, list):
+                images = [images]
+            
+            for img in images:
+                if isinstance(img, str):
+                    # Image file path
+                    user_content.append({
+                        "type": "image",
+                        "image": {"image_file": img}
+                    })
+                else:
+                    # PIL Image (already loaded)
+                    user_content.append({
+                        "type": "image", 
+                        "image": img
+                    })
+        
+        # Process videos 
+        if 'video' in mm_data:
+            videos = mm_data['video']
+            if not isinstance(videos, list):
+                videos = [videos]
+                
+            for video in videos:
+                if isinstance(video, str):
+                    # Video file path
+                    user_content.append({
+                        "type": "video",
+                        "video": {"video_file": video}
+                    })
+                else:
+                    # List of PIL Images (frames)
+                    user_content.append({
+                        "type": "video",
+                        "video": video
+                    })
+        
+        # Add text prompt
+        user_content.append({
+            "type": "text", 
+            "text": prompt
+        })
+        
+        messages.append({
+            "role": "user",
+            "content": user_content
+        })
+        
+        # Get processing config from mm_kwargs
         processing_config = mm_kwargs.get('processing_config', {
             'do_crop': False,
             'do_padding': False, 
             'do_resize': False,
-            'max_pixels': 460800,  # 1280 * 720 // 2
+            'max_pixels': int(1280 * 720 // 2),
             'min_pixels': 0
         })
         
-        # Apply custom preprocessing to images if present - following TarsierProcessor pattern
-        if 'image' in processed_mm_data:
-            images = processed_mm_data['image']
-            if not isinstance(images, list):
-                images = [images]
-            
-            # Apply custom preprocessing
-            processed_images = []
-            for img in images:
-                if isinstance(img, Image.Image):
-                    processed_img = self.info._apply_custom_tarsier2_preprocessing(img, processing_config)
-                    processed_images.append(processed_img)
-                else:
-                    processed_images.append(img)
-            
-            processed_mm_data['image'] = processed_images
-        
-        # Call HF processor with minimal kwargs to avoid size parameter issues
-        # Following TarsierProcessor pattern of using default processor configuration
-        processor_kwargs = dict(mm_kwargs)
-        # Remove processing_config as it's not needed by the HF processor
-        processor_kwargs.pop('processing_config', None)
-        
-        return self.info.ctx.call_hf_processor(
-            self.info.get_hf_processor(**processor_kwargs),
-            dict(text=prompt, **processed_mm_data),
-            # Pass only essential image processor kwargs to avoid size parameter conflicts
-            {k: v for k, v in self.info._get_image_processor_kwargs(**processor_kwargs).items() 
-             if k in ['min_pixels', 'max_pixels'] and v is not None},
-        )
+        # Process using TarsierProcessor
+        return processor(messages, processing_config=processing_config)
 
     def _get_prompt_updates(
         self,
