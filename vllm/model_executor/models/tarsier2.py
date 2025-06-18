@@ -291,13 +291,57 @@ class Tarsier2ProcessingInfo(BaseProcessingInfo):
         size: Optional[dict[str, int]] = None,
         **kwargs: object,
     ) -> Qwen2VLImageProcessor:
-        return cached_image_processor_from_config(
-            self.ctx.model_config,
-            **self._get_image_processor_kwargs(min_pixels=min_pixels,
-                                               max_pixels=max_pixels,
-                                               size=size,
-                                               **kwargs),
-        )
+        # Check if model config has malformed size parameter that would cause issues
+        mm_config = self.ctx.model_config.get_multimodal_config()
+        has_malformed_size = False
+        if mm_config.mm_processor_kwargs and 'size' in mm_config.mm_processor_kwargs:
+            config_size = mm_config.mm_processor_kwargs['size']
+            if isinstance(config_size, dict):
+                required_keys = {'shortest_edge', 'longest_edge'}
+                if not required_keys.issubset(config_size.keys()):
+                    has_malformed_size = True
+        
+        if has_malformed_size:
+            # Create image processor directly to avoid config merge issue
+            # Following TarsierProcessor pattern of using minimal configuration
+            from transformers import AutoImageProcessor
+            
+            # Get essential parameters only
+            processor_kwargs = {}
+            if min_pixels is not None:
+                processor_kwargs["min_pixels"] = min_pixels
+            if max_pixels is not None:
+                processor_kwargs["max_pixels"] = max_pixels
+            
+            # Add other safe parameters from mm_processor_kwargs
+            if mm_config.mm_processor_kwargs:
+                safe_params = ['do_convert_rgb', 'do_normalize', 'do_rescale', 'do_resize', 
+                              'image_mean', 'image_std', 'max_pixels', 'min_pixels', 
+                              'merge_size', 'patch_size', 'resample', 'rescale_factor', 
+                              'temporal_patch_size']
+                for param in safe_params:
+                    if param in mm_config.mm_processor_kwargs:
+                        processor_kwargs[param] = mm_config.mm_processor_kwargs[param]
+            
+            return AutoImageProcessor.from_pretrained(
+                self.ctx.model_config.model,
+                revision=self.ctx.model_config.revision,
+                trust_remote_code=self.ctx.model_config.trust_remote_code,
+                **processor_kwargs,
+            )
+        else:
+            # Normal path when no malformed size parameter
+            processor_kwargs = self._get_image_processor_kwargs(
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                size=size,
+                **kwargs
+            )
+            
+            return cached_image_processor_from_config(
+                self.ctx.model_config,
+                **processor_kwargs,
+            )
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         return {"image": None, "video": None}
